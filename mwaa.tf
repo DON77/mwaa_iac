@@ -16,101 +16,56 @@ terraform {
 
 # Import public subnet CIDRs if necessary
 # resource "aws_subnet" "public_subnet" { ... }  # This will be imported
-# VPC for MWAA (assuming you have this already)
+# VPC for MWAA 
 resource "aws_vpc" "default_vpc" {
-  # Assuming you have a VPC, keep this part as is
+  # default VPC imported
 }
 
 # Private subnet CIDRs in the var.private_subnets
-# resource "aws_subnet" "mwaa_private_subnet" {
-#   count                   = length(var.private_subnets)
-#   vpc_id                  = aws_vpc.default_vpc.id
-#   cidr_block              = var.private_subnets[count.index]
-#   availability_zone       = data.aws_availability_zones.available.names[count.index]
-#   map_public_ip_on_launch = false
-#   tags                    = var.common_tags
-# }
+resource "aws_subnet" "mwaa_private_subnet" {
+  count                   = length(var.private_subnets)
+  vpc_id                  = aws_vpc.default_vpc.id
+  cidr_block              = var.private_subnets[count.index]
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = false
+  tags                    = var.common_tags
+}
 
 # Public Subnet Route Tables (imported as you mentioned)
 # Assuming you already have a public route table, if not, use this part for public route table creation:
 # resource "aws_route_table" "public_route_table" { ... }
 
-# resource "aws_nat_gateway" "mwaa_nat_gateway" {
-#   #allocation_id = aws_eip.nat_eip.id
-#   subnet_id     = var.public_subnets[0]  # Pick any of your public subnets
+#NAT gateway should be placed in public subnet, we will reuse existing one 
+#  resource "aws_nat_gateway" "mwaa_nat_gateway" {
+#   allocation_id = aws_eip.mwaa_nat_eip.id
+#   subnet_id     = aws_subnet.mwaa_private_subnet[0].id  
 #   tags = var.common_tags
 # }
 
-# Elastic IP for NAT Gateway
-# resource "aws_eip" "mwaa_nat_eip" {
-#   #vpc = true  # Make sure it's associated with your VPC
-#   domain = "vpc"
-#   tags = var.common_tags
-# }
-
-# **Private Route Table** to route traffic via the NAT gateway
-resource "aws_route_table" "mwaa_private_route_table" {
-  vpc_id = aws_vpc.default_vpc.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    nat_gateway_id = var.nat_gateway  # Pointing to NAT gateway
-  }
-  
+#Elastic IP for NAT Gateway
+resource "aws_eip" "mwaa_nat_eip" {
+  #vpc = true  # Make sure it's associated with your VPC
+  domain = "vpc"
   tags = var.common_tags
 }
 
-# **Private Subnet Route Table Association** for the private subnets
-# resource "aws_route_table_association" "private_subnet_association" {
-#   count          = length(var.private_subnets)
-#   subnet_id      = aws_subnet.mwaa_private_subnet[count.index].id
-#   route_table_id = aws_route_table.private_route_table.id
+# **Private Route Table** to route traffic via the NAT gateway
+# resource "aws_route_table" "mwaa_private_route_table" {
+#   vpc_id = aws_vpc.default_vpc.id
+
+#   route {
+#     cidr_block = "0.0.0.0/0"
+#     nat_gateway_id = var.nat_gateway
+#   }
+#   tags = var.common_tags
 # }
 
-# **MWAA Environment Configuration**
-resource "aws_mwaa_environment" "mwaa" {
-  name               = "mwaa-env"
-  environment_class  = "mw1.small"
-  execution_role_arn = aws_iam_role.mwaa_role.arn
-  source_bucket_arn  = aws_s3_bucket.mwaa_sync_bucket.arn
-  dag_s3_path        = "s3://mwaa_sync_bucket/dags"
-  max_workers        = var.max_workers
-
-  network_configuration {
-    subnet_ids         = var.private_subnets[*]
-    security_group_ids = [aws_security_group.mwaa_sg.id]
-  }
-
-  logging_configuration {
-    dag_processing_logs {
-      enabled   = true
-      log_level = "DEBUG"
-    }
-
-    scheduler_logs {
-      enabled   = true
-      log_level = "INFO"
-    }
-
-    task_logs {
-      log_level = "WARNING"
-    }
-
-    webserver_logs {
-      log_level = "ERROR"
-    }
-
-    worker_logs {
-      enabled   = true
-      log_level = "CRITICAL"
-    }
-  }
-
-  webserver_access_mode = "PUBLIC_ONLY"
-  tags                  = var.common_tags
+# **Private Subnet Route Table Association** for the private subnets
+resource "aws_route_table_association" "private_subnet_association" {
+  count          = length(var.private_subnets)
+  subnet_id      = aws_subnet.mwaa_private_subnet[count.index].id
+  route_table_id = var.route_table_id
 }
-
-# **IAM Role for MWAA**
 resource "aws_iam_role" "mwaa_role" {
   name = "mwaa-airflow-role"
 
@@ -121,7 +76,7 @@ resource "aws_iam_role" "mwaa_role" {
         Action    = "sts:AssumeRole"
         Effect    = "Allow"
         Principal = {
-          Service = "airflow.amazonaws.com"
+          Service = ["airflow-env.amazonaws.com","airflow.amazonaws.com"] 
         }
       }
     ]
@@ -129,84 +84,34 @@ resource "aws_iam_role" "mwaa_role" {
   tags = var.common_tags
 }
 
-# **IAM Policy for MWAA** (S3 + RDS)
+# **IAM Policy for MWAA** 
 resource "aws_iam_policy" "mwaa_policy" {
   name        = "mwaa-airflow-policy"
   description = "Policy for Airflow with necessary permissions"
-
-  # policy = jsonencode({
-  #   Version = "2012-10-17"
-  #   Statement = [
-  #     {
-  #       Action   = [
-  #         "s3:ListBucket",
-  #         "s3:GetObject",
-  #         "s3:PutObject",
-  #         "s3:DeleteObject"
-  #       ]
-  #       Effect   = "Allow"
-  #       Resource = [
-  #         aws_s3_bucket.mwaa_sync_bucket.arn,
-  #         "${aws_s3_bucket.mwaa_sync_bucket.arn}/*"
-  #       ]
-  #     },
-  #     {
-  #       Action   = [
-  #         "rds:DescribeDBInstances",
-  #         "rds:DescribeDBClusters",
-  #         "rds:Connect",
-  #       ] 
-  #       Effect   = "Allow"
-  #       Resource = "*"
-  #     },
-  #     {
-  #       Action = "secretsmanager:GetSecretValue",
-  #       Effect = "Allow",
-  #       Resource = "arn:aws:secretsmanager:${var.region}:${var.account_id}:secret:DB_*",
-  #     },
-  #     {
-  #       Action   = "logs:CreateLogGroup"
-  #       Effect   = "Allow"
-  #       Resource = "*"
-  #     },
-  #     {
-  #       Action   = "logs:CreateLogStream"
-  #       Effect   = "Allow"
-  #       Resource = "*"
-  #     },
-  #     {
-  #       Action   = "logs:PutLogEvents"
-  #       Effect   = "Allow"
-  #       Resource = "*"
-  #     }
-  #   ]
-  # })
   policy = jsonencode({
     "Version": "2012-10-17",
-    "Statement": [
+     "Statement": [
         {
             "Effect": "Allow",
             "Action": "airflow:PublishMetrics",
-            "Resource": "arn:aws:airflow:${var.region}:${var.account_id}:environment/${aws_mwaa_environment.mwaa.name}"
-        },
-        {
-            "Effect": "Deny",
-            "Action": "s3:ListAllMyBuckets",
-            "Resource": [
-                "${aws_s3_bucket.mwaa_sync_bucket.arn}",
-                "${aws_s3_bucket.mwaa_sync_bucket.arn}/*"
-            ]
+            "Resource": "arn:aws:airflow:${var.region}:${var.account_id}:environment/${aws_mwaa_environment.mwaa.name}*"
         },
         {
             "Effect": "Allow",
             "Action": [
                 "s3:GetObject*",
                 "s3:GetBucket*",
-                "s3:List*"
+                "s3:List*",
+                "s3:ListBucket",
+                "s3:PutObject",
+                "s3:DeleteObject"
             ],
             "Resource": [
                 "${aws_s3_bucket.mwaa_sync_bucket.arn}",
-                "${aws_s3_bucket.mwaa_sync_bucket.arn}/*"
+                "${aws_s3_bucket.mwaa_sync_bucket.arn}/*",
+                 "${aws_s3_bucket.mwaa_sync_bucket.arn}/dags/*",
+                 "${aws_s3_bucket.mwaa_sync_bucket.arn}/plugins/*",
+                "${aws_s3_bucket.mwaa_sync_bucket.arn}/requirements/*",
             ]
         },
         {
@@ -221,7 +126,7 @@ resource "aws_iam_policy" "mwaa_policy" {
                 "logs:GetQueryResults"
             ],
             "Resource": [
-                "arn:aws:logs:${var.region}:${var.account_id}:log-group:airflow-${aws_mwaa_environment.mwaa.name}-*"
+                "arn:aws:logs:${var.region}:${var.account_id}:log-group:airflow-${aws_mwaa_environment.mwaa.name}-*",
             ]
         },
         {
@@ -281,7 +186,6 @@ resource "aws_iam_policy" "mwaa_policy" {
             "Action": [
                 "rds:DescribeDBInstances",
                 "rds:DescribeDBClusters",
-                "rds:Connect",
                 "rds:DescribeDBClusterEndpoints"
             ],
             "Resource": "arn:aws:rds:${var.region}:${var.account_id}:db:${var.prod_instance}"
@@ -292,12 +196,12 @@ resource "aws_iam_policy" "mwaa_policy" {
                 "secretsmanager:GetSecretValue"
             ],
             "Resource": "arn:aws:secretsmanager:${var.region}:${var.account_id}:secret:DB*"
-        }
+        },
     ]
 })
 
   tags = var.common_tags
-  depends_on = [ aws_s3_bucket.mwaa_sync_bucket ]
+  #depends_on = [ aws_s3_bucket.mwaa_sync_bucket ]
 }
 
 # **Attach IAM policy to MWAA role**
@@ -306,17 +210,59 @@ resource "aws_iam_role_policy_attachment" "mwaa_role_attachment" {
   role       = aws_iam_role.mwaa_role.name
 }
 
-# **CloudWatch Log Groups (refactored to use dynamic naming based on MWAA environment)**
-resource "aws_cloudwatch_log_group" "mwaa_task_log_group" {
-  name  = "/aws/mwaa/env-${aws_mwaa_environment.mwaa.name}/task"
-  tags  = var.common_tags
-  depends_on = [ aws_mwaa_environment.mwaa ]
-}
+#**MWAA Environment Configuration**
+resource "aws_mwaa_environment" "mwaa" {
+  name               = "mwaa-env"
+  environment_class  = "mw1.small"
+  execution_role_arn = aws_iam_role.mwaa_role.arn
+  source_bucket_arn  = aws_s3_bucket.mwaa_sync_bucket.arn
+  dag_s3_path        = "dags/"
+  
 
-resource "aws_cloudwatch_log_group" "mwaa_webserver_log_group" {
-  name  = "/aws/mwaa/env-${aws_mwaa_environment.mwaa.name}/webserver"
-  tags  = var.common_tags
-  depends_on = [ aws_mwaa_environment.mwaa ]
+  plugins_s3_path    = "plugins/plugins.zip"
+  requirements_s3_path = "requirements/requirements.txt"
+  max_workers        = var.max_workers
+
+  network_configuration {
+    subnet_ids         = aws_subnet.mwaa_private_subnet[*].id
+    security_group_ids = [var.security_group_id]
+
+  }
+
+  logging_configuration {
+    dag_processing_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+
+    scheduler_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+
+    task_logs {
+      log_level = "INFO"
+      enabled = true
+    }  
+    
+    webserver_logs {
+      log_level = "INFO"
+      enabled = true
+    }
+
+    worker_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+  }
+
+  webserver_access_mode = "PUBLIC_ONLY"
+  tags                  = var.common_tags
+  airflow_configuration_options = {
+    "webserver.warn_deployment_exposure" = "false"
+    #"core.log_level" = "debug"
+  }
+  #depends_on =[aws_iam_role_policy_attachment.mwaa_role_attachment]
 }
 
 # S3 bucket for MWAA sync
@@ -325,20 +271,59 @@ resource "aws_s3_bucket" "mwaa_sync_bucket" {
   tags   = var.common_tags
   
 }
+
 resource "aws_s3_bucket_versioning" "mwaa_versioning" {
   bucket = aws_s3_bucket.mwaa_sync_bucket.id
+  
   versioning_configuration {
+    
     status = "Enabled"
   }
 }
 
 # Security group for MWAA
-resource "aws_security_group" "mwaa_sg" {
-  name        = "mwaa-security-group"
-  description = "Security group for MWAA"
-  vpc_id      = aws_vpc.default_vpc.id
-  tags        = var.common_tags
-}
+# resource "aws_security_group" "mwaa_sg" {
+#   egress {
+#     from_port        = 0
+#     to_port          = 0
+#     protocol         = "-1"
+#     cidr_blocks      = ["0.0.0.0/0"]
+#   }
+#   ingress {
+#     from_port        = 0
+#     to_port          = 0
+#     protocol         = "-1"
+#     cidr_blocks      = ["0.0.0.0/0"]
+#     self = true
+#   }
+#   ingress{
+#     cidr_blocks      = ["0.0.0.0/0"]
+#     from_port        = 443
+#     protocol         = "tcp"
+#     self             = true
+#     to_port          = 443
+
+#   }
+#   ingress {
+#     from_port        = 5432
+#     to_port = 5432
+#     protocol         = "tcp"
+#     self = true
+#   }
+#   ingress {
+#     from_port        = 8080
+#     to_port = 8080
+#     protocol         = "tcp"
+#     self = true
+#   }
+#   #443 self should be added here or imported
+#   name        = "mwaa-security-group"
+#   revoke_rules_on_delete = false
+#   description = "Security group for MWAA"
+#   vpc_id      = aws_vpc.default_vpc.id
+#   tags        = var.common_tags
+  
+# }
 
 # IAM Role for GitHub Actions to assume (OIDC)
 resource "aws_iam_role" "github_actions_role" {
@@ -351,7 +336,7 @@ resource "aws_iam_role" "github_actions_role" {
         Action = "sts:AssumeRoleWithWebIdentity"
         Effect = "Allow"
         Principal = {
-          Federated = "arn:aws:iam::aws:policy/AWSWebIdentity"
+          Federated = "arn:aws:iam::${var.account_id}:oidc-provider/token.actions.githubusercontent.com"
         }
         Condition = {
           StringEquals = {
@@ -380,9 +365,10 @@ resource "aws_iam_policy" "github_actions_policy" {
           "s3:ListBucket",
           "s3:GetObject",
           "s3:PutObject", 
+          "s3:DeleteObject"
         ]
         Effect   = "Allow"
-        Resource = "${aws_s3_bucket.mwaa_sync_bucket.arn}/*"
+        Resource = ["${aws_s3_bucket.mwaa_sync_bucket.arn}","${aws_s3_bucket.mwaa_sync_bucket.arn}/*"]
       }
     ]
   })
@@ -394,3 +380,8 @@ resource "aws_iam_role_policy_attachment" "github_actions_role_policy" {
   role       = aws_iam_role.github_actions_role.name
   policy_arn = aws_iam_policy.github_actions_policy.arn
 }
+
+# import{
+#   to = "mwaa_oidc_provider"
+#   id = "arn:aws:iam::930985312118:oidc-provider/token.actions.githubusercontent.com"
+# } 

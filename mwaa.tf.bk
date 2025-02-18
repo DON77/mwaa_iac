@@ -1,0 +1,253 @@
+provider "aws" {
+  region = "eu-central-1"
+}
+terraform{
+    backend "s3" {
+        bucket = "buycycle-mwaa-tf-state"
+        key    = "terraform/state"
+        region = "eu-central-1"
+        dynamodb_table = "buycycle-mwaa-tf-state-lock"
+        encrypt        = true 
+}
+}
+#-----------import block---------------#
+#staging reader instance to be imported
+resource "aws_db_instance" "staging_instance" {
+  # (resource arguments)
+  instance_class         = "db.t3.medium"   
+  allocated_storage      = 1                
+  engine                 = "aurora-mysql"   
+  engine_version         = "8.0.mysql_aurora.3.05.2"
+  username               = "" 
+  password               = "" 
+  db_name                = "buycycle"
+  publicly_accessible    = true
+  skip_final_snapshot    = true
+}
+
+resource "aws_vpc" "default_vpc" {
+  #public_subnets =["subnet-001349e7dbb8d996f","subnet-0ee5aab97e281f0b0","subnet-0fe99c5dc67b02d48"]
+}
+
+resource "aws_vpc_endpoint_subnet_association" "private_subnet_assoc" { 
+  count = "${length(var.private_subnets)}"
+  vpc_endpoint_id = aws_vpc.default_vpc.id
+  subnet_id = aws_subnet.mwaa_private_subnet[count.index].id
+}
+
+# S3 bucket for MWAA sync
+resource "aws_s3_bucket" "mwaa_sync_bucket" {
+  bucket = "mwaa-sync-bucket"
+  tags   = var.common_tags
+}
+
+# VPC for MWAA
+#resource "aws_vpc" "mwaa_vpc" {
+#  cidr_block = "10.0.0.0/16"
+#  enable_dns_support    = true
+#  enable_dns_hostnames  = true
+#  tags = var.common_tags
+#}
+
+data "aws_availability_zones" "available" {}
+
+# Private subnet in the VPC
+resource "aws_subnet" "mwaa_private_subnet" {
+  count                   = "${length(var.private_subnets)}"
+  vpc_id                  = aws_vpc.default_vpc.id
+  cidr_block              = "${var.private_subnets[count.index]}"
+  availability_zone       = "${data.aws_availability_zones.available.names[count.index]}"
+  map_public_ip_on_launch = false
+  tags                    = var.common_tags
+}
+
+# Security group for MWAA
+resource "aws_security_group" "mwaa_sg" {
+  name        = "mwaa-security-group"
+  description = "Security group for MWAA"
+  vpc_id      = aws_vpc.default_vpc.id
+  tags        = var.common_tags
+}
+
+# IAM role for MWAA
+resource "aws_iam_role" "mwaa_role" {
+  name = "mwaa-airflow-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
+        Principal = {
+          Service = "airflow.amazonaws.com"
+        }
+      }
+    ]
+  })
+  tags = var.common_tags
+}
+
+# IAM policy for MWAA
+resource "aws_iam_policy" "mwaa_policy" {
+  name        = "mwaa-airflow-policy"
+  description = "Policy for Airflow with necessary permissions"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action   = [
+          "s3:ListBucket",
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ]
+        Effect   = "Allow"
+        Resource = [
+          aws_s3_bucket.mwaa_sync_bucket.arn,
+          "${aws_s3_bucket.mwaa_sync_bucket.arn}/*"
+        ]
+      },
+      {
+        Action   = "rds:DescribeDBInstances"
+        Effect   = "Allow"
+        Resource = "*"
+      },
+      {
+        Action   = "logs:CreateLogGroup"
+        Effect   = "Allow"
+        Resource = "*"
+      },
+      {
+        Action   = "logs:CreateLogStream"
+        Effect   = "Allow"
+        Resource = "*"
+      },
+      {
+        Action   = "logs:PutLogEvents"
+        Effect   = "Allow"
+        Resource = "*"
+      }
+    ]
+  })
+  tags = var.common_tags
+}
+
+# Attach policy to the IAM role
+resource "aws_iam_role_policy_attachment" "mwaa_role_attachment" {
+  policy_arn = aws_iam_policy.mwaa_policy.arn
+  role       = aws_iam_role.mwaa_role.name
+}
+
+# MWAA environment resource
+resource "aws_mwaa_environment" "mwaa" {
+  name               = "mwaa-env"
+  #let's skip setting it unless we need exact version to run
+  #airflow_version    = "2.10.4" by default it has been set to the latest version 
+  environment_class  = "mw1.small"
+  execution_role_arn = aws_iam_role.mwaa_role.arn
+  source_bucket_arn  = aws_s3_bucket.mwaa_sync_bucket.arn
+  dag_s3_path = "s3://mwaa_sync_bucket/dags"
+  max_workers = var.max_workers
+    network_configuration {
+      subnet_ids         = [aws_subnet.mwaa_private_subnet[0].id,aws_subnet.mwaa_private_subnet[1].id]
+      security_group_ids = [aws_security_group.mwaa_sg.id]
+    }
+
+  logging_configuration {
+
+    dag_processing_logs {
+      enabled   = true
+      log_level = "DEBUG"
+    }
+
+    scheduler_logs {
+      enabled   = true
+      log_level = "INFO"
+    }
+
+    task_logs {
+      log_level               = "WARNING"
+    }
+    
+    webserver_logs {
+      log_level               = "ERROR"
+    }
+
+    worker_logs {
+      enabled   = true
+      log_level = "CRITICAL"
+    }
+  }
+  #assuming we have to connect to the service publicly
+  webserver_access_mode = "VPC_ONLY"
+  tags                  = var.common_tags
+}
+
+# IAM Role for GitHub Actions to assume (OIDC)
+resource "aws_iam_role" "github_actions_role" {
+  name = "GitHubActionsRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Effect = "Allow"
+        Principal = {
+          Federated = "arn:aws:iam::aws:policy/AWSWebIdentity"
+        }
+        Condition = {
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          }
+          StringLike = {
+            "token.actions.githubusercontent.com:sub" = "repo:buycycle/data:*"
+          }
+        }
+      }
+    ]
+  })
+  tags = var.common_tags
+}
+
+# GitHub Actions policy for accessing S3
+resource "aws_iam_policy" "github_actions_policy" {
+  name        = "GitHubActionsPolicy"
+  description = "Custom policy for GitHub Actions to access AWS services"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "s3:ListBucket",
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ]
+        Effect = "Allow"
+        Resource = "${aws_s3_bucket.mwaa_sync_bucket.arn}/*"
+      }
+    ]
+  })
+  tags = var.common_tags
+}
+
+# Attach GitHub Actions policy to the role
+resource "aws_iam_role_policy_attachment" "github_actions_role_policy" {
+  role       = aws_iam_role.github_actions_role.name
+  policy_arn = aws_iam_policy.github_actions_policy.arn
+}
+
+# CloudWatch Log groups for MWAA
+resource "aws_cloudwatch_log_group" "mwaa_log_group" {
+  name  = "/aws/mwaa/env-mwaa-env/task"
+  tags  = var.common_tags
+}
+
+resource "aws_cloudwatch_log_group" "mwaa_webserver_log_group" {
+  name  = "/aws/mwaa/env-mwaa-env/webserver"
+  tags  = var.common_tags
+}
